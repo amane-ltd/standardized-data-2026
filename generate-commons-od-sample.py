@@ -16,6 +16,12 @@ GTFS ZIP から、COMmmmONS 乗降実績仕様 (v1.0) に準拠した OD（一�
 
   python3 generate-commons-od-sample.py [GTFS.zip] [-o OUT.csv]
 
+特定の停留所に接続する路線に絞る:
+- --via に停留所名（stops.txt の stop_name）をカンマ区切りで渡すと、そのいずれかに
+  停車する路線ごとに、その停留所に停まる先頭の便で上記 10 件を生成し、1 ファイルに連結する。
+
+  python3 generate-commons-od-sample.py GTFS.zip --via 桂駅東口,桂駅西口 -o OUT.csv
+
 出典: https://www.mlit.go.jp/commmmons/document/005/
 """
 
@@ -57,22 +63,23 @@ def parse_gtfs_time(hms: str, base: date) -> datetime:
     return datetime(base.year, base.month, base.day) + timedelta(hours=h, minutes=m, seconds=s)
 
 
-def load_first_trip(zf: zipfile.ZipFile):
-    """先頭の便と、その停車停留所（順序付き）を返す。"""
-    trips = read_table(zf, "trips.txt")
-    if not trips:
-        raise SystemExit("trips.txt に便がありません")
-    trip = trips[0]
+def iter_table(zf: zipfile.ZipFile, name: str):
+    """GTFS の txt を 1 行ずつ dict で返す（stop_times.txt のような大きな表向け）。"""
+    with zf.open(name) as f:
+        yield from csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig"))
 
+
+def load_masters(zf: zipfile.ZipFile):
+    """routes / stops / agency を id 引きの dict で返す。"""
     routes = {r["route_id"]: r for r in read_table(zf, "routes.txt")}
     stops = {s["stop_id"]: s for s in read_table(zf, "stops.txt")}
     agencies = {a.get("agency_id", ""): a for a in read_table(zf, "agency.txt")}
+    return routes, stops, agencies
 
-    route = routes.get(trip["route_id"], {})
-    agency = agencies.get(route.get("agency_id", "")) or next(iter(agencies.values()), {})
 
-    times = [r for r in read_table(zf, "stop_times.txt") if r["trip_id"] == trip["trip_id"]]
-    times.sort(key=lambda r: int(r["stop_sequence"]))
+def build_sequence(trip, times, stops):
+    """stop_times の行から、停車停留所の順序付きリストを作る。"""
+    times = sorted(times, key=lambda r: int(r["stop_sequence"]))
     if len(times) < 2:
         raise SystemExit(f"便 {trip['trip_id']} の停車停留所が不足しています")
 
@@ -82,7 +89,7 @@ def load_first_trip(zf: zipfile.ZipFile):
         except (TypeError, ValueError):
             return 0.0
 
-    sequence = [
+    return [
         {
             "stop_id": t["stop_id"],
             "stop_name": stops.get(t["stop_id"], {}).get("stop_name", t["stop_id"]),
@@ -93,7 +100,60 @@ def load_first_trip(zf: zipfile.ZipFile):
         }
         for t in times
     ]
+
+
+def route_and_agency(trip, routes, agencies):
+    route = routes.get(trip["route_id"], {})
+    agency = agencies.get(route.get("agency_id", "")) or next(iter(agencies.values()), {})
+    return route, agency
+
+
+def load_first_trip(zf: zipfile.ZipFile):
+    """先頭の便と、その停車停留所（順序付き）を返す。"""
+    trips = read_table(zf, "trips.txt")
+    if not trips:
+        raise SystemExit("trips.txt に便がありません")
+    trip = trips[0]
+
+    routes, stops, agencies = load_masters(zf)
+    route, agency = route_and_agency(trip, routes, agencies)
+
+    times = [r for r in iter_table(zf, "stop_times.txt") if r["trip_id"] == trip["trip_id"]]
+    sequence = build_sequence(trip, times, stops)
     return trip, route, agency, sequence, load_fares(zf)
+
+
+def load_trips_via(zf: zipfile.ZipFile, via_names):
+    """指定した停留所名のいずれかに停車する路線ごとに、その停留所に停まる先頭の便
+    （trips.txt の並び順）を選び、[(trip, route, agency, sequence), ...] を route_id 順で返す。"""
+    routes, stops, agencies = load_masters(zf)
+    via_ids = {sid for sid, s in stops.items() if s.get("stop_name") in via_names}
+    missing = set(via_names) - {stops[sid]["stop_name"] for sid in via_ids}
+    if missing:
+        raise SystemExit(f"stops.txt に無い停留所名: {', '.join(sorted(missing))}")
+
+    # 1 パス目: 指定停留所に停まる便を洗い出す
+    hit_trips = {r["trip_id"] for r in iter_table(zf, "stop_times.txt") if r["stop_id"] in via_ids}
+    chosen = {}  # route_id -> trip
+    for trip in read_table(zf, "trips.txt"):
+        if trip["trip_id"] in hit_trips and trip["route_id"] not in chosen:
+            chosen[trip["route_id"]] = trip
+    if not chosen:
+        raise SystemExit("指定停留所に停車する便がありません")
+
+    # 2 パス目: 選んだ便の stop_times だけを集める
+    chosen_ids = {t["trip_id"] for t in chosen.values()}
+    times_by_trip = {tid: [] for tid in chosen_ids}
+    for r in iter_table(zf, "stop_times.txt"):
+        if r["trip_id"] in chosen_ids:
+            times_by_trip[r["trip_id"]].append(r)
+
+    result = []
+    for route_id in sorted(chosen):
+        trip = chosen[route_id]
+        route, agency = route_and_agency(trip, routes, agencies)
+        result.append((trip, route, agency, build_sequence(trip, times_by_trip[trip["trip_id"]], stops)))
+    return result
 
 
 def resolve_service_date(zf: zipfile.ZipFile, service_id: str) -> date:
@@ -227,7 +287,7 @@ def pick_od_pairs(sequence):
     return pairs
 
 
-def build_records(trip, route, agency, sequence, fares, service_date):
+def build_records(trip, route, agency, sequence, fares, service_date, start_id=1):
     agency_code = agency.get("agency_id", "")
     agency_name = agency.get("agency_name", "")
     route_id = route.get("route_id", trip["route_id"])
@@ -236,7 +296,7 @@ def build_records(trip, route, agency, sequence, fares, service_date):
 
     pairs = pick_od_pairs(sequence)
     rows = []
-    for i, (b_idx, a_idx) in enumerate(pairs, start=1):
+    for i, (b_idx, a_idx) in enumerate(pairs, start=start_id):
         b = sequence[b_idx]
         a = sequence[a_idx]
         boarding_dt = parse_gtfs_time(b["departure"], service_date)
@@ -301,7 +361,16 @@ def main():
         default=str(DEFAULT_OUT),
         help="出力 CSV パス（省略時: commons-od-sample.csv）",
     )
+    parser.add_argument(
+        "--via",
+        help="停留所名をカンマ区切りで指定すると、そのいずれかに停車する路線ごとに"
+             "（その停留所に停まる先頭の便で）OD を各 10 件生成して 1 ファイルにまとめる",
+    )
     args = parser.parse_args()
+
+    if args.via:
+        main_via(args, [n.strip() for n in args.via.split(",") if n.strip()])
+        return
 
     with open_feed(Path(args.feed)) as zf:
         trip, route, agency, sequence, fares = load_first_trip(zf)
@@ -320,6 +389,34 @@ def main():
     print(f"Wrote {len(rows)} rows to {args.out}\n")
     for r in rows:
         print(f"  #{r['ridership_record_id']:2d}  {r['boarding_station_name']} → {r['alighting_station_name']}")
+
+
+def main_via(args, via_names):
+    """--via 指定時: 指定停留所に停車する路線ごとに OD を生成して連結する。"""
+    with open_feed(Path(args.feed)) as zf:
+        selected = load_trips_via(zf, via_names)
+        fares = load_fares(zf)
+        dates = {}
+        for trip, *_ in selected:
+            sid = trip.get("service_id", "")
+            if sid not in dates:
+                dates[sid] = resolve_service_date(zf, sid)
+
+    rows = []
+    print(f"Feed:  {args.feed}")
+    print(f"Via:   {', '.join(via_names)}")
+    print(f"対象路線: {len(selected)}\n")
+    for trip, route, agency, sequence in selected:
+        service_date = dates[trip.get("service_id", "")]
+        recs = build_records(trip, route, agency, sequence, fares, service_date, start_id=len(rows) + 1)
+        rows.extend(recs)
+        via_hit = sorted({s["stop_name"] for s in sequence if s["stop_name"] in via_names})
+        print(f"  {route.get('route_id', '')} {route.get('route_long_name', '')}"
+              f"  便 {trip['trip_id']} ({len(sequence)} stops, {service_date})"
+              f"  {recs[0]['boarding_station_name']} → {recs[0]['alighting_station_name']}"
+              f"  [経由: {', '.join(via_hit)}]")
+    write_csv(rows, Path(args.out))
+    print(f"\nWrote {len(rows)} rows to {args.out}")
 
 
 if __name__ == "__main__":

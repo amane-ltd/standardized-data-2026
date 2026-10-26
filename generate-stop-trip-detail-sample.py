@@ -20,6 +20,13 @@ GTFS から、運行管理システム / APC 出力を模した「停留所×便
 
   python3 generate-stop-trip-detail-sample.py [GTFS.zip] [-o OUT.csv]
 
+特定の停留所に接続する路線に絞る:
+- --via に停留所名（stops.txt の stop_name）をカンマ区切りで渡すと、そのいずれかに
+  停車する路線ごとに、その停留所に停まる先頭の便で生成し、1 ファイルに連結する
+  （便 ID は連結順に 1 からの通し番号）。便の選び方は OD サンプルの --via と同じ。
+
+  python3 generate-stop-trip-detail-sample.py GTFS.zip --via 桂駅東口,桂駅西口 -o OUT.csv
+
 参考: gtfs-cooker では自動判定で `stop-trip-detail` として認識され、
       `通過人数` を区間断面利用者数（segment）として GTFS と結合できる。
 """
@@ -310,13 +317,68 @@ def generate(feed_path, out_path):
     return rows, first_tid, t, target, feed_start, routes
 
 
+def generate_via(feed_path, out_path, via_names):
+    """指定停留所名のいずれかに停車する路線ごとに、その停留所に停まる先頭の便
+    （trips.txt の並び順）を選び、route_id 順に連結して出力する。
+    便の選び方は generate-commons-od-sample.py --via と同じ。"""
+    stops, routes, trips, calendar, cal_dates, stop_times, feed_start = load_feed(feed_path)
+    pattern_ids = build_pattern_ids(trips)
+
+    via_ids = {sid for sid, name in stops.items() if name in via_names}
+    missing = set(via_names) - {stops[sid] for sid in via_ids}
+    if missing:
+        raise SystemExit(f"stops.txt に無い停留所名: {', '.join(sorted(missing))}")
+
+    chosen = {}  # route_id -> trip_id
+    for tid, t in trips.items():
+        if t["route_id"] in chosen:
+            continue
+        if any(sid in via_ids for _, sid, _dep, _arr in stop_times.get(tid, [])):
+            chosen[t["route_id"]] = tid
+    if not chosen:
+        raise SystemExit("指定停留所に停車する便がありません")
+
+    rows, summary = [], []
+    for bin_id, route_id in enumerate(sorted(chosen), start=1):
+        tid = chosen[route_id]
+        t = trips[tid]
+        target = find_target_date(t["service_id"], calendar, cal_dates, feed_start)
+        trip_rows = build_trip_rows(target, tid, t, bin_id, routes, stops, stop_times, pattern_ids)
+        rows.extend(trip_rows)
+        via_hit = sorted({stops[sid] for _, sid, _dep, _arr in stop_times[tid] if sid in via_ids})
+        summary.append((tid, t, target, len(trip_rows), via_hit))
+
+    with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(HEADER)
+        w.writerows(rows)
+
+    return rows, summary, routes
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="坂出202601.csv 形式の停留所×便別実績サンプル生成（先頭便・単日）")
     parser.add_argument("feed", nargs="?", default=str(DEFAULT_FEED),
                         help="GTFS ZIP のパス（省略時: 坂出フィード）")
     parser.add_argument("-o", "--out", default=str(DEFAULT_OUT), help="出力 CSV パス")
+    parser.add_argument("--via",
+                        help="停留所名をカンマ区切りで指定すると、そのいずれかに停車する路線ごとに"
+                             "（その停留所に停まる先頭の便で）生成して 1 ファイルにまとめる")
     args = parser.parse_args()
+
+    if args.via:
+        via_names = [n.strip() for n in args.via.split(",") if n.strip()]
+        rows, summary, routes = generate_via(Path(args.feed), Path(args.out), via_names)
+        print(f"Feed:          {args.feed}")
+        print(f"Via:           {', '.join(via_names)}")
+        print(f"対象路線:      {len(summary)}\n")
+        for tid, t, target, n, via_hit in summary:
+            route_name = (routes.get(t["route_id"], {}).get("route_long_name") or t["route_id"])
+            print(f"  {t['route_id']} {route_name}  便 {tid} ({n} stops, {target})"
+                  f"  [経由: {', '.join(via_hit)}]")
+        print(f"\n生成完了:      {args.out}  ({len(rows):,} 行)")
+        return
 
     rows, tid, t, target, feed_start, routes = generate(Path(args.feed), Path(args.out))
 
